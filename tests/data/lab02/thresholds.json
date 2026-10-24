@@ -1,0 +1,4 @@
+{
+ "search_recall_e5": 0.75,
+ "attention_share_on_antecedent": 0.625
+}

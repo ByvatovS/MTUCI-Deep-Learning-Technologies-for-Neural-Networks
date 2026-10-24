@@ -1,0 +1,38 @@
+{
+ "tokenizer": "Qwen/Qwen3-0.6B-Base",
+ "vocab_size": 151669,
+ "context_tokens": 4096,
+ "ru": {
+  "words": 100,
+  "tokens": 198,
+  "tokens_per_word": 1.98,
+  "words_in_context": 2068
+ },
+ "en": {
+  "words": 70,
+  "tokens": 81,
+  "tokens_per_word": 1.157,
+  "words_in_context": 3539
+ },
+ "example_ru": [
+  "х",
+  "оч",
+  "ет",
+  " для",
+  " благ",
+  "а",
+  " мира",
+  " и",
+  " что",
+  " они",
+  " об",
+  "ещ",
+  "али",
+  " ничего",
+  " и",
+  " что",
+  " об",
+  "ещ",
+  "али"
+ ]
+}

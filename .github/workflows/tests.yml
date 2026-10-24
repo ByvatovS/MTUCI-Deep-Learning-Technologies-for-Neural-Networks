@@ -1,0 +1,141 @@
+name: tests
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      labs:
+        description: "Работы через запятую, например 02,03. Пусто значит все"
+        required: false
+        default: ""
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COURSE_REPO: https://github.com/pmenshih/tgo-course
+
+jobs:
+  # Какие работы проверять: затронутые пушем, не заглушки и с тестами в репозитории курса.
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      labs: ${{ steps.filter.outputs.labs }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Затронутые работы
+        id: changed
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+          INPUT_LABS: ${{ inputs.labs }}
+        run: |
+          all="lab02 lab03 lab04 lab05 lab06 lab07"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ -z "$INPUT_LABS" ]; then
+              labs="$all"
+            else
+              labs=$(echo "$INPUT_LABS" | tr ',' '\n' | tr -d ' ' | sed -E 's/^(lab)?0?([0-9])$/lab0\2/' | grep -E '^lab[0-9]{2}$' | sort -u | tr '\n' ' ')
+            fi
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            # первый пуш в ветку или история переписана: сравнивать не с чем
+            labs="$all"
+          elif git diff --name-only "$BEFORE" "$SHA" | grep -qx 'requirements.txt'; then
+            # сменилось окружение: перепроверить все начатые работы
+            labs="$all"
+          else
+            labs=$(git diff --name-only "$BEFORE" "$SHA" | grep -oE '^lab[0-9]{2}/' | tr -d '/' | sort -u | tr '\n' ' ')
+          fi
+          echo "Затронуты: ${labs:-нет}"
+          echo "labs=$labs" >> "$GITHUB_OUTPUT"
+
+      - name: Тесты из репозитория курса
+        if: steps.changed.outputs.labs != ''
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse "$COURSE_REPO" "$RUNNER_TEMP/course"
+          git -C "$RUNNER_TEMP/course" sparse-checkout set tests
+          rm -rf tests && cp -r "$RUNNER_TEMP/course/tests" tests
+
+      - name: Отбор работ
+        id: filter
+        env:
+          LABS: ${{ steps.changed.outputs.labs }}
+        run: |
+          selected=()
+          for lab in $LABS; do
+            if [ ! -f "$lab/run.py" ]; then
+              echo "пропуск $lab: нет $lab/run.py"
+            elif grep -q NotImplementedError "$lab/run.py"; then
+              echo "пропуск $lab: заглушка, работа не начата"
+            elif [ ! -f "tests/test_$lab.py" ]; then
+              echo "пропуск $lab: тестов для нее в курсе пока нет"
+            else
+              selected+=("\"$lab\"")
+            fi
+          done
+          json="[$(IFS=,; echo "${selected[*]}")]"
+          echo "К проверке: $json"
+          echo "labs=$json" >> "$GITHUB_OUTPUT"
+
+  # По задаче на работу: падение одной не останавливает остальные, а кэш моделей у каждой свой.
+  test:
+    needs: select
+    if: needs.select.outputs.labs != '' && needs.select.outputs.labs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lab: ${{ fromJSON(needs.select.outputs.labs) }}
+    name: ${{ matrix.lab }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Тесты из репозитория курса
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse "$COURSE_REPO" "$RUNNER_TEMP/course"
+          git -C "$RUNNER_TEMP/course" sparse-checkout set tests
+          rm -rf tests && cp -r "$RUNNER_TEMP/course/tests" tests
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # torch с индекса CPU: сборка с CUDA весит несколько гигабайт, а GPU у раннера нет
+      # Пакеты из requirements.txt курса (общие для всех работ, обновляются централизованно)
+      # и из requirements.txt копии (свои пакеты студента). Файлы с корня попадают в sparse-checkout.
+      - name: Зависимости
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r "$RUNNER_TEMP/course/requirements.txt"
+          pip install -r requirements.txt
+
+      - name: Кэш моделей
+        id: hf-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ matrix.lab }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Запуск работы
+        run: python ${{ matrix.lab }}/run.py --fast
+
+      # Кэш сохраняется до тестов: пока тесты красные, модели не качаются заново на каждый пуш
+      - name: Сохранить кэш моделей
+        if: steps.hf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ matrix.lab }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Тесты
+        # настройки pytest тоже из курса, чтобы pytest.ini и conftest.py копии не меняли состав тестов
+        run: pytest -c "$RUNNER_TEMP/course/pytest.ini" --rootdir . --noconftest tests/test_${{ matrix.lab }}.py -v

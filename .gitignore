@@ -10,4 +10,9 @@ tgo-course.code-workspace
 lectures/*/*.pptx
 lectures/*/assets/
 .~lock.*#
-labs/*/solution/
+assignments/*/solution/
+
+# артефакты работ коммитятся, корпусы нет
+!*/artifacts/*.csv
+!assignments/*/examples/*.csv
+*/corpus.txt
