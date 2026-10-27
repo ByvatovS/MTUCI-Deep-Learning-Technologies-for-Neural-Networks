@@ -130,6 +130,74 @@ def make_bpe_artifact(words: list[str], fast: bool) -> dict:
     }
 
 
+# --------------------------------------------------------------------- Transformers
+def import_ml():
+    try:
+        import numpy as np
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+    except ImportError as exc:  # pragma: no cover
+        raise SystemExit("Нужны зависимости из requirements.txt: pip install -r requirements.txt") from exc
+    return np, torch, AutoModel, AutoTokenizer
+
+
+def load_qwen(AutoModel, AutoTokenizer):
+    print("Загружаю Qwen3-0.6B-Base...")
+    tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    # eager обязателен для output_attentions; модель не нужно загружать дважды.
+    model = AutoModel.from_pretrained(QWEN_MODEL, attn_implementation="eager")
+    model.eval()
+    return tokenizer, model
+
+
+def masked_mean(hidden, attention_mask, torch):
+    mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
+    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+
+
+def qwen_vectors(texts: list[str], tokenizer, model, kind: str, torch, batch_size: int = 4):
+    """Static = таблица input embeddings; contextual = последний hidden state."""
+    vectors = []
+    with torch.inference_mode():
+        for start in range(0, len(texts), batch_size):
+            batch = tokenizer(texts[start:start + batch_size], return_tensors="pt", padding=True,
+                              truncation=True, max_length=512, add_special_tokens=False)
+            if kind == "static":
+                hidden = model.get_input_embeddings()(batch["input_ids"])
+            else:
+                hidden = model(**batch, output_hidden_states=True, use_cache=False).hidden_states[-1]
+            vectors.append(masked_mean(hidden, batch["attention_mask"], torch).float().cpu())
+    return torch.cat(vectors).numpy()
+
+
+def e5_vectors(texts: list[str], prefix: str, tokenizer, model, torch, batch_size: int = 16):
+    vectors = []
+    with torch.inference_mode():
+        for start in range(0, len(texts), batch_size):
+            batch = tokenizer([prefix + text for text in texts[start:start + batch_size]],
+                              return_tensors="pt", padding=True, truncation=True, max_length=512)
+            vectors.append(masked_mean(model(**batch).last_hidden_state, batch["attention_mask"], torch).float().cpu())
+    return torch.cat(vectors).numpy()
+
+
+def make_token_artifact(corpus_words: list[str], tokenizer) -> dict:
+    ru_words = corpus_words[499:599]  # слова с 500 по 600, ровно 100
+    ru_text = " ".join(ru_words)
+    en_words = ENGLISH_PARAGRAPH.split()
+    ru_ids = tokenizer(ru_text, add_special_tokens=False)["input_ids"]
+    en_ids = tokenizer(ENGLISH_PARAGRAPH, add_special_tokens=False)["input_ids"]
+    ru_per_word, en_per_word = len(ru_ids) / len(ru_words), len(en_ids) / len(en_words)
+    return {"tokenizer": QWEN_MODEL, "vocab_size": int(tokenizer.vocab_size), "context_tokens": 4096,
+            "ru": {"words": len(ru_words), "tokens": len(ru_ids), "tokens_per_word": round(ru_per_word, 3),
+                   "words_in_context": int(4096 / ru_per_word)},
+            "en": {"words": len(en_words), "tokens": len(en_ids), "tokens_per_word": round(en_per_word, 3),
+                   "words_in_context": int(4096 / en_per_word)},
+            "example_ru": tokenizer.convert_ids_to_tokens(ru_ids[:20])}
+
+
 
 
 def main() -> None:
@@ -140,6 +208,11 @@ def main() -> None:
     corpus = load_corpus()
     words = normalized_words(corpus)
     save_json("bpe.json", make_bpe_artifact(words, args.fast))
+
+    np, torch, AutoModel, AutoTokenizer = import_ml()
+    qwen_tokenizer, qwen_model = load_qwen(AutoModel, AutoTokenizer)
+    tokens = make_token_artifact(words, qwen_tokenizer)
+    save_json("tokens_per_word.json", tokens)
 
 
 if __name__ == "__main__":
