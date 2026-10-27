@@ -153,6 +153,33 @@ def load_qwen(AutoModel, AutoTokenizer):
     return tokenizer, model
 
 
+
+def make_token_artifact(corpus_words: list[str], tokenizer) -> dict:
+    ru_words = corpus_words[499:599]  # слова с 500 по 600, ровно 100
+    ru_text = " ".join(ru_words)
+    en_words = ENGLISH_PARAGRAPH.split()
+    ru_ids = tokenizer(ru_text, add_special_tokens=False)["input_ids"]
+    en_ids = tokenizer(ENGLISH_PARAGRAPH, add_special_tokens=False)["input_ids"]
+    ru_per_word, en_per_word = len(ru_ids) / len(ru_words), len(en_ids) / len(en_words)
+    return {"tokenizer": QWEN_MODEL, "vocab_size": int(tokenizer.vocab_size), "context_tokens": 4096,
+            "ru": {"words": len(ru_words), "tokens": len(ru_ids), "tokens_per_word": round(ru_per_word, 3),
+                   "words_in_context": int(4096 / ru_per_word)},
+            "en": {"words": len(en_words), "tokens": len(en_ids), "tokens_per_word": round(en_per_word, 3),
+                   "words_in_context": int(4096 / en_per_word)},
+            "example_ru": tokenizer.convert_ids_to_tokens(ru_ids[:20])}
+
+
+# ------------------------------------------------------------------------- Search
+def select_paragraphs(corpus: str, fast: bool) -> list[dict]:
+    raw_paragraphs = re.split(r"\r?\n\s*\r?\n", corpus)
+    selected = []
+    for raw in raw_paragraphs:
+        text = re.sub(r"\s+", " ", raw).strip()
+        if 40 <= len(normalized_words(text)) <= 120:
+            selected.append({"id": len(selected), "text": text})
+    return selected[:(60 if fast else 500)]
+
+
 def masked_mean(hidden, attention_mask, torch):
     mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
     return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
@@ -183,19 +210,39 @@ def e5_vectors(texts: list[str], prefix: str, tokenizer, model, torch, batch_siz
     return torch.cat(vectors).numpy()
 
 
-def make_token_artifact(corpus_words: list[str], tokenizer) -> dict:
-    ru_words = corpus_words[499:599]  # слова с 500 по 600, ровно 100
-    ru_text = " ".join(ru_words)
-    en_words = ENGLISH_PARAGRAPH.split()
-    ru_ids = tokenizer(ru_text, add_special_tokens=False)["input_ids"]
-    en_ids = tokenizer(ENGLISH_PARAGRAPH, add_special_tokens=False)["input_ids"]
-    ru_per_word, en_per_word = len(ru_ids) / len(ru_words), len(en_ids) / len(en_words)
-    return {"tokenizer": QWEN_MODEL, "vocab_size": int(tokenizer.vocab_size), "context_tokens": 4096,
-            "ru": {"words": len(ru_words), "tokens": len(ru_ids), "tokens_per_word": round(ru_per_word, 3),
-                   "words_in_context": int(4096 / ru_per_word)},
-            "en": {"words": len(en_words), "tokens": len(en_ids), "tokens_per_word": round(en_per_word, 3),
-                   "words_in_context": int(4096 / en_per_word)},
-            "example_ru": tokenizer.convert_ids_to_tokens(ru_ids[:20])}
+def cosine_top_k(matrix, queries, np, k: int = 5) -> list[list[int]]:
+    matrix = matrix / np.linalg.norm(matrix, axis=1, keepdims=True).clip(min=1e-12)
+    queries = queries / np.linalg.norm(queries, axis=1, keepdims=True).clip(min=1e-12)
+    return [np.argsort(-(row), kind="stable")[:k].astype(int).tolist() for row in queries @ matrix.T]
+
+
+def make_search_artifacts(corpus: str, fast: bool, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer):
+    paragraphs = select_paragraphs(corpus, fast)
+    if not paragraphs:
+        raise RuntimeError("Не удалось выбрать абзацы из корпуса")
+    queries = json.loads(QUERIES_PATH.read_text(encoding="utf-8"))
+    texts, query_texts = [p["text"] for p in paragraphs], [q["query"] for q in queries]
+    print(f"Строю векторы Qwen для {len(paragraphs)} абзацев...")
+    static_top = cosine_top_k(qwen_vectors(texts, qwen_tokenizer, qwen_model, "static", torch),
+                              qwen_vectors(query_texts, qwen_tokenizer, qwen_model, "static", torch), np)
+    contextual_top = cosine_top_k(qwen_vectors(texts, qwen_tokenizer, qwen_model, "contextual", torch),
+                                  qwen_vectors(query_texts, qwen_tokenizer, qwen_model, "contextual", torch), np)
+    print("Загружаю multilingual-e5-small и строю поисковые векторы...")
+    e5_tokenizer, e5_model = AutoTokenizer.from_pretrained(E5_MODEL), AutoModel.from_pretrained(E5_MODEL)
+    e5_model.eval()
+    e5_top = cosine_top_k(e5_vectors(texts, "passage: ", e5_tokenizer, e5_model, torch),
+                          e5_vectors(query_texts, "query: ", e5_tokenizer, e5_model, torch), np)
+    result_queries = []
+    for index, source in enumerate(queries):
+        matches = [p["id"] for p in paragraphs if source["answer_phrase"] in p["text"]]
+        if not matches:
+            raise RuntimeError(f"В выбранных абзацах нет ответа: {source['answer_phrase']}")
+        result_queries.append({**source, "answer_id": matches[0],
+                               "top": {"static": static_top[index], "contextual": contextual_top[index], "e5": e5_top[index]}})
+    recalls = {method: round(sum(q["answer_id"] in q["top"][method] for q in result_queries) / len(result_queries), 3)
+               for method in ("static", "contextual", "e5")}
+    return paragraphs, {"k": 5, "n_paragraphs": len(paragraphs), "queries": result_queries, "recall_at_k": recalls}
+
 
 
 
@@ -213,6 +260,10 @@ def main() -> None:
     qwen_tokenizer, qwen_model = load_qwen(AutoModel, AutoTokenizer)
     tokens = make_token_artifact(words, qwen_tokenizer)
     save_json("tokens_per_word.json", tokens)
+
+    paragraphs, search = make_search_artifacts(corpus, args.fast, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer)
+    save_json("paragraphs.json", paragraphs)
+    save_json("search.json", search)
 
 
 if __name__ == "__main__":
