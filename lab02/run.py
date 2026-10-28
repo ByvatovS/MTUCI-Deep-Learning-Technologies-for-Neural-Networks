@@ -158,7 +158,8 @@ def make_token_artifact(corpus_words: list[str], tokenizer) -> dict:
     ru_words = corpus_words[499:599]  # слова с 500 по 600, ровно 100
     ru_text = " ".join(ru_words)
     en_words = ENGLISH_PARAGRAPH.split()
-    ru_ids = tokenizer(ru_text, add_special_tokens=False)["input_ids"]
+    ru_encoded = tokenizer(ru_text, add_special_tokens=False, return_offsets_mapping=True)
+    ru_ids = ru_encoded["input_ids"]
     en_ids = tokenizer(ENGLISH_PARAGRAPH, add_special_tokens=False)["input_ids"]
     ru_per_word, en_per_word = len(ru_ids) / len(ru_words), len(en_ids) / len(en_words)
     return {"tokenizer": QWEN_MODEL, "vocab_size": int(tokenizer.vocab_size), "context_tokens": 4096,
@@ -166,15 +167,18 @@ def make_token_artifact(corpus_words: list[str], tokenizer) -> dict:
                    "words_in_context": int(4096 / ru_per_word)},
             "en": {"words": len(en_words), "tokens": len(en_ids), "tokens_per_word": round(en_per_word, 3),
                    "words_in_context": int(4096 / en_per_word)},
-            "example_ru": tokenizer.convert_ids_to_tokens(ru_ids[:20])}
+            # У Qwen byte-level представление токенов выглядит как «Ð...». Для
+            # отчёта берём исходные символы текста по смещениям токенов.
+            "example_ru": [ru_text[start:end] for start, end in ru_encoded["offset_mapping"][:20]]}
 
 
 # ------------------------------------------------------------------------- Search
 def select_paragraphs(corpus: str, fast: bool) -> list[dict]:
-    raw_paragraphs = re.split(r"\r?\n\s*\r?\n", corpus)
+    raw_paragraphs = corpus.splitlines()
     selected = []
     for raw in raw_paragraphs:
-        text = re.sub(r"\s+", " ", raw).strip()
+        # Абзац храним как в исходном корпусе; тесты сверяют текст посимвольно.
+        text = raw.strip()
         if 40 <= len(normalized_words(text)) <= 120:
             selected.append({"id": len(selected), "text": text})
     return selected[:(60 if fast else 500)]
@@ -252,7 +256,7 @@ def token_positions(offsets, start: int, end: int) -> list[int]:
 
 def attention_artifact(tokenizer, model, torch) -> dict:
     encoded = tokenizer(ATTENTION_SENTENCE, return_offsets_mapping=True, add_special_tokens=False, return_tensors="pt")
-    offsets, input_ids = encoded.pop("offset_mapping")[0].tolist(), encoded["input_ids"]
+    offsets = encoded.pop("offset_mapping")[0].tolist()
     pronoun, antecedent = re.search(r"\bего\b", ATTENTION_SENTENCE), re.search(r"пациента", ATTENTION_SENTENCE)
     assert pronoun and antecedent
     pronoun_pos = token_positions(offsets, pronoun.start(), pronoun.end())
@@ -267,7 +271,16 @@ def attention_artifact(tokenizer, model, torch) -> dict:
             best_share, best_layer, best_head = float(value), layer, int(head)
             best_weights = rows[best_head].tolist()
     assert best_weights is not None
-    return {"sentence": ATTENTION_SENTENCE, "tokens": tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+    # Веса получены из bfloat16, поэтому их сумма может чуть отличаться от 1.
+    # Нормируем перед сохранением: это то же распределение, но без погрешности.
+    weight_sum = sum(best_weights)
+    best_weights = [weight / weight_sum for weight in best_weights]
+    best_share = sum(best_weights[index] for index in antecedent_pos)
+    # convert_ids_to_tokens у Qwen показывает внутренние byte-level токены
+    # («Ð...») вместо кириллицы. Смещения однозначно возвращают фрагменты
+    # исходного предложения и подходят для подписей графика.
+    display_tokens = [ATTENTION_SENTENCE[start:end] for start, end in offsets]
+    return {"sentence": ATTENTION_SENTENCE, "tokens": display_tokens,
             "pronoun_pos": pronoun_pos, "antecedent_pos": antecedent_pos, "best_layer": best_layer,
             "best_head": best_head, "weights": best_weights, "share_on_antecedent": round(best_share, 6)}
 
@@ -289,7 +302,11 @@ def dilution_rows(corpus: str, tokenizer, model, torch, fast: bool) -> list[dict
     lengths = (64, 256, 768) if fast else (128, 512, 1024)
     instruction_ids = tokenizer(INSTRUCTION, add_special_tokens=False)["input_ids"]
     newline_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
-    filler_ids = tokenizer(corpus, add_special_tokens=False)["input_ids"]
+    # Нужна лишь первая тысяча токенов наполнителя. Токенизация всего романа
+    # вызывает предупреждение о превышении максимальной длины модели.
+    filler_ids = tokenizer(
+        corpus, add_special_tokens=False, truncation=True, max_length=max(lengths)
+    )["input_ids"]
     rows = []
     for context_len in lengths:
         ids = (instruction_ids + newline_ids + filler_ids)[:context_len]
