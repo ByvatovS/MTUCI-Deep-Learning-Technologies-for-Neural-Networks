@@ -245,6 +245,70 @@ def make_search_artifacts(corpus: str, fast: bool, qwen_tokenizer, qwen_model, t
 
 
 
+# ---------------------------------------------------------------------- Attention
+def token_positions(offsets, start: int, end: int) -> list[int]:
+    return [i for i, (left, right) in enumerate(offsets) if left < end and right > start]
+
+
+def attention_artifact(tokenizer, model, torch) -> dict:
+    encoded = tokenizer(ATTENTION_SENTENCE, return_offsets_mapping=True, add_special_tokens=False, return_tensors="pt")
+    offsets, input_ids = encoded.pop("offset_mapping")[0].tolist(), encoded["input_ids"]
+    pronoun, antecedent = re.search(r"\bего\b", ATTENTION_SENTENCE), re.search(r"пациента", ATTENTION_SENTENCE)
+    assert pronoun and antecedent
+    pronoun_pos = token_positions(offsets, pronoun.start(), pronoun.end())
+    antecedent_pos = token_positions(offsets, antecedent.start(), antecedent.end())
+    with torch.inference_mode():
+        attentions = model(**encoded, output_attentions=True, use_cache=False).attentions
+    best_share, best_layer, best_head, best_weights = -1.0, 0, 0, None
+    for layer, layer_attention in enumerate(attentions):
+        rows = layer_attention[0, :, pronoun_pos[-1], :].float().cpu()
+        value, head = rows[:, antecedent_pos].sum(dim=1).max(dim=0)
+        if float(value) > best_share:
+            best_share, best_layer, best_head = float(value), layer, int(head)
+            best_weights = rows[best_head].tolist()
+    assert best_weights is not None
+    return {"sentence": ATTENTION_SENTENCE, "tokens": tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+            "pronoun_pos": pronoun_pos, "antecedent_pos": antecedent_pos, "best_layer": best_layer,
+            "best_head": best_head, "weights": best_weights, "share_on_antecedent": round(best_share, 6)}
+
+
+def draw_attention_chart(attention: dict) -> None:
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(max(10, len(attention["tokens"]) * .55), 4.8))
+    colors = ["#d95f02" if i in attention["antecedent_pos"] else "#4c78a8" for i in range(len(attention["tokens"]))]
+    plt.bar(range(len(attention["tokens"])), attention["weights"], color=colors)
+    plt.xticks(range(len(attention["tokens"])), attention["tokens"], rotation=45, ha="right")
+    plt.ylabel("Вес внимания")
+    plt.title(f"Qwen3: слой {attention['best_layer']}, голова {attention['best_head']}")
+    plt.tight_layout()
+    plt.savefig(ARTIFACTS / "attention_map.png", dpi=160)
+    plt.close()
+
+
+def dilution_rows(corpus: str, tokenizer, model, torch, fast: bool) -> list[dict]:
+    lengths = (64, 256, 768) if fast else (128, 512, 1024)
+    instruction_ids = tokenizer(INSTRUCTION, add_special_tokens=False)["input_ids"]
+    newline_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
+    filler_ids = tokenizer(corpus, add_special_tokens=False)["input_ids"]
+    rows = []
+    for context_len in lengths:
+        ids = (instruction_ids + newline_ids + filler_ids)[:context_len]
+        if len(ids) != context_len:
+            raise RuntimeError("Корпус слишком короток для опыта с attention")
+        inputs = {"input_ids": torch.tensor([ids], dtype=torch.long),
+                  "attention_mask": torch.ones((1, context_len), dtype=torch.long)}
+        with torch.inference_mode():
+            layers = model(**inputs, output_attentions=True, use_cache=False).attentions
+        instruction_end = len(instruction_ids)
+        shares = [layer[0, :, -1, 1:instruction_end].float().sum(dim=-1).mean().item() for layer in layers]
+        sink = [layer[0, :, -1, 0].float().mean().item() for layer in layers]
+        instruction_len = instruction_end - 1  # первый токен намеренно исключён как attention sink
+        rows.append({"context_len": context_len, "instruction_len": instruction_len,
+                     "share_on_instruction": round(sum(shares) / len(shares), 6),
+                     "sink_share": round(sum(sink) / len(sink), 6),
+                     "uniform_share": round(instruction_len / context_len, 6)})
+    return rows
+
 
 
 def main() -> None:
@@ -264,6 +328,15 @@ def main() -> None:
     paragraphs, search = make_search_artifacts(corpus, args.fast, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer)
     save_json("paragraphs.json", paragraphs)
     save_json("search.json", search)
+
+    attention = attention_artifact(qwen_tokenizer, qwen_model, torch)
+    save_json("attention_map.json", attention)
+    draw_attention_chart(attention)
+    dilution = dilution_rows(corpus, qwen_tokenizer, qwen_model, torch, args.fast)
+    with (ARTIFACTS / "dilution.csv").open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(dilution[0]))
+        writer.writeheader()
+        writer.writerows(dilution)
 
 
 if __name__ == "__main__":
