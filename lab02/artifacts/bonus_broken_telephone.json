@@ -1,0 +1,21 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "instruction": "Отвечай только по-русски и в конце каждого ответа ставь слово КОНЕЦ.",
+  "results": [
+    {
+      "context_len": 128,
+      "answer": "- Eh bien, mon prince. Gênes et Lueques ne sont plus que des apanages, des поместья, de la famille Buonaparte. Non, je vous préviens que si vous ne me dites pas que nous avons la guerre, si vous vous permettez",
+      "ends_with_konec": false
+    },
+    {
+      "context_len": 512,
+      "answer": "Л. Н. Толстой «Война и мир»\n\n- КОНЕЦ.",
+      "ends_with_konec": true
+    },
+    {
+      "context_len": 1024,
+      "answer": "- КОНЕЦ.",
+      "ends_with_konec": true
+    }
+  ]
+}

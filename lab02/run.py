@@ -22,6 +22,7 @@ QUERIES_PATH = COURSE_ROOT / "tests" / "data" / "lab02" / "queries.json"
 CORPUS_URL = ("https://raw.githubusercontent.com/nevmenandr/word2vec-russian-novels/"
               "master/books_before/WarAndPeace.txt")
 QWEN_MODEL = "Qwen/Qwen3-0.6B-Base"
+QWEN_CHAT_MODEL = "Qwen/Qwen3-0.6B"
 E5_MODEL = "intfloat/multilingual-e5-small"
 WORD_RE = re.compile(r"[а-я]+(?:-[а-я]+)*")
 ENGLISH_PARAGRAPH = (
@@ -33,6 +34,38 @@ ENGLISH_PARAGRAPH = (
 )
 ATTENTION_SENTENCE = "Врач осмотрел пациента и сказал, что его анализы готовы."
 INSTRUCTION = "Отвечай только по-русски и в конце каждого ответа ставь слово КОНЕЦ."
+
+# Запросы написаны своими словами к абзацам со второй половины выборки из 500.
+# answer_phrase нужна только для автоматической проверки правильного абзаца.
+BONUS_OWN_QUERIES = [
+    ("Что почувствовали Ростов и немецкий крестьянин после случайной радостной встречи?",
+     "взаимной любви"),
+    ("Какая деталь одежды выделялась во внешности Денисова, когда он подошёл к дому?",
+     "смятая гусарская шапочка"),
+    ("Как Ростов относился к Телянину, хотя не мог разумно объяснить причину этого чувства?",
+     "беспричинного отвращения"),
+    ("Как, по мнению Денисова, любовь меняет человека?",
+     "Мы спим, пока не любим"),
+    ("Чем Телянин заплатил слуге после окончания завтрака?",
+     "двойной кошелек"),
+    ("Каким образом Телянин пытался показать, будто его действия с чужой вещью совершенно обычны?",
+     "кладу в карман свой кошелек"),
+    ("Как изменилось внутреннее состояние Ростова после отчаянных слов другого человека?",
+     "огромный камень сомнения"),
+    ("Что Ростов считал приемлемым наказанием, но что считал невозможным для себя?",
+     "дать мне удовлетворение"),
+    ("Почему герой предпочёл военную службу дипломатической?",
+     "в гусары и пошел"),
+    ("Что старшие офицеры считали важнее собственного конфликта и обиды?",
+     "честь полка дорога"),
+]
+
+POLYSEMY_EXAMPLES = [
+    ("замок", "Ключ от старой двери лежал на столе."),
+    ("замок", "Потерянный ключ от квартиры нашли в кармане пальто."),
+    ("родник", "Лесной ключ оказался холодным и чистым."),
+    ("родник", "Этот ключ питает ручей у дороги."),
+]
 
 
 def save_json(name: str, payload: object) -> None:
@@ -327,13 +360,198 @@ def dilution_rows(corpus: str, tokenizer, model, torch, fast: bool) -> list[dict
     return rows
 
 
+# -------------------------------------------------------------------------- Bonus
+def bonus_own_queries(paragraphs, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer):
+    """Повторяет поиск для десяти авторских запросов ко второй половине корпуса."""
+    texts = [paragraph["text"] for paragraph in paragraphs]
+    query_texts = [query for query, _ in BONUS_OWN_QUERIES]
+    result_queries = []
+    for query, phrase in BONUS_OWN_QUERIES:
+        matches = [paragraph["id"] for paragraph in paragraphs if phrase in paragraph["text"]]
+        if not matches:
+            raise RuntimeError(f"Для бонусного запроса не найдена фраза: {phrase}")
+        if matches[0] < len(paragraphs) // 2:
+            raise RuntimeError(f"Бонусный ответ должен быть во второй половине: {phrase}")
+        result_queries.append({"query": query, "answer_phrase": phrase, "answer_id": matches[0]})
+
+    static_top = cosine_top_k(
+        qwen_vectors(texts, qwen_tokenizer, qwen_model, "static", torch),
+        qwen_vectors(query_texts, qwen_tokenizer, qwen_model, "static", torch), np,
+    )
+    contextual_top = cosine_top_k(
+        qwen_vectors(texts, qwen_tokenizer, qwen_model, "contextual", torch),
+        qwen_vectors(query_texts, qwen_tokenizer, qwen_model, "contextual", torch), np,
+    )
+    e5_tokenizer = AutoTokenizer.from_pretrained(E5_MODEL)
+    e5_model = AutoModel.from_pretrained(E5_MODEL)
+    e5_model.eval()
+    e5_top = cosine_top_k(
+        e5_vectors(texts, "passage: ", e5_tokenizer, e5_model, torch),
+        e5_vectors(query_texts, "query: ", e5_tokenizer, e5_model, torch), np,
+    )
+    for index, item in enumerate(result_queries):
+        item["top"] = {
+            "static": static_top[index],
+            "contextual": contextual_top[index],
+            "e5": e5_top[index],
+        }
+    recalls = {
+        method: round(sum(item["answer_id"] in item["top"][method] for item in result_queries) / len(result_queries), 3)
+        for method in ("static", "contextual", "e5")
+    }
+    return {"k": 5, "n_paragraphs": len(paragraphs), "queries": result_queries, "recall_at_k": recalls}
+
+
+def contextual_word_vector(sentence: str, word: str, tokenizer, model, torch, np):
+    """Усредняет контекстные векторы токенов конкретного слова в предложении."""
+    encoded = tokenizer(sentence, add_special_tokens=False, return_offsets_mapping=True, return_tensors="pt")
+    offsets = encoded.pop("offset_mapping")[0].tolist()
+    match = re.search(rf"\b{re.escape(word)}\b", sentence, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Слово «{word}» не найдено в предложении: {sentence}")
+    positions = token_positions(offsets, match.start(), match.end())
+    with torch.inference_mode():
+        hidden = model(**encoded, output_hidden_states=True, use_cache=False).hidden_states[-1][0]
+    vector = hidden[positions].mean(dim=0).float().cpu().numpy()
+    vector /= np.linalg.norm(vector).clip(min=1e-12)
+    return positions, vector
+
+
+def bonus_polysemy(tokenizer, model, torch, np):
+    """Сравнивает контекстные векторы слова «ключ» в двух значениях."""
+    records, vectors = [], []
+    for sense, sentence in POLYSEMY_EXAMPLES:
+        positions, vector = contextual_word_vector(sentence, "ключ", tokenizer, model, torch, np)
+        records.append({"sense": sense, "sentence": sentence, "token_positions": positions})
+        vectors.append(vector)
+    similarities = np.stack(vectors) @ np.stack(vectors).T
+    within = [float(similarities[0, 1]), float(similarities[2, 3])]
+    between = [float(similarities[left, right]) for left in (0, 1) for right in (2, 3)]
+    return {
+        "word": "ключ",
+        "examples": records,
+        "cosine_similarity": similarities.round(6).tolist(),
+        "within_sense_mean": round(float(np.mean(within)), 6),
+        "between_sense_mean": round(float(np.mean(between)), 6),
+        "within_is_closer": bool(np.mean(within) > np.mean(between)),
+    }
+
+
+def chat_input_for_length(tokenizer, filler: str, target_length: int):
+    """Подбирает длину user-сообщения, чтобы chat prompt занял ровно target_length токенов."""
+    def build(char_count: int):
+        messages = [
+            {"role": "system", "content": INSTRUCTION},
+            {"role": "user", "content": filler[:char_count]},
+        ]
+        try:
+            encoded = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True,
+                enable_thinking=False, return_tensors="pt",
+            )
+        except TypeError:  # Для старых версий transformers без enable_thinking.
+            encoded = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            )
+        # В зависимости от версии transformers метод может вернуть либо Tensor,
+        # либо BatchEncoding. Дальше нам нужен именно двумерный input_ids.
+        return encoded["input_ids"] if hasattr(encoded, "input_ids") else encoded
+
+    # Длинный корпус целиком здесь не нужен: для 1024 токенов достаточно
+    # небольшого начального фрагмента. Это также не даёт токенизатору пытаться
+    # обработать сотни тысяч токенов при первой итерации двоичного поиска.
+    low, high = 0, min(len(filler), target_length * 12)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if build(middle).shape[-1] <= target_length:
+            low = middle
+        else:
+            high = middle - 1
+    # После двоичного поиска проверяем ближайшие символы: byte-level BPE может
+    # менять длину prompt сразу на несколько токенов.
+    for char_count in range(low, min(len(filler), low + 1024) + 1):
+        input_ids = build(char_count)
+        if input_ids.shape[-1] == target_length:
+            return input_ids
+        if input_ids.shape[-1] > target_length:
+            break
+    raise RuntimeError(f"Не удалось собрать chat prompt длиной {target_length} токенов")
+
+
+def bonus_broken_telephone(corpus: str, fast: bool, torch, AutoTokenizer):
+    """Проверяет, когда чат-модель перестаёт соблюдать слово «КОНЕЦ»."""
+    from transformers import AutoModelForCausalLM
+
+    print("Загружаю чат-версию Qwen для бонуса «испорченный телефон»...")
+    tokenizer = AutoTokenizer.from_pretrained(QWEN_CHAT_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(QWEN_CHAT_MODEL)
+    model.eval()
+    lengths = (64, 256, 768) if fast else (128, 512, 1024)
+    rows = []
+    for target_length in lengths:
+        input_ids = chat_input_for_length(tokenizer, corpus, target_length)
+        with torch.inference_mode():
+            generated = model.generate(
+                input_ids, max_new_tokens=64, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        answer = tokenizer.decode(generated[0, input_ids.shape[-1]:], skip_special_tokens=True).strip()
+        ends_with_end = bool(re.search(r"КОНЕЦ[.!…]?\s*$", answer, flags=re.IGNORECASE))
+        rows.append({
+            "context_len": int(input_ids.shape[-1]),
+            "answer": answer,
+            "ends_with_konec": ends_with_end,
+        })
+    return {"model": QWEN_CHAT_MODEL, "instruction": INSTRUCTION, "results": rows}
+
+
+def run_bonuses(corpus, paragraphs, fast, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer):
+    """Запускает все дополнительные эксперименты только по явному флагу --bonus."""
+    print("Бонус: авторские запросы...")
+    # В --fast основной поиск хранит лишь 60 абзацев, но задание для бонуса
+    # требует запросы ко второй половине полной выборки из 500 абзацев.
+    bonus_paragraphs = paragraphs if len(paragraphs) >= 500 else select_paragraphs(corpus, fast=False)
+    save_json("bonus_own_queries.json", bonus_own_queries(
+        bonus_paragraphs, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer
+    ))
+    print("Бонус: многозначное слово «ключ»...")
+    save_json("bonus_polysemy.json", bonus_polysemy(qwen_tokenizer, qwen_model, torch, np))
+    # Базовая и чат-версии Qwen одновременно занимают много памяти, поэтому
+    # освобождаем первую перед загрузкой второй.
+    del qwen_model
+    import gc
+    gc.collect()
+    print("Бонус: испорченный телефон...")
+    save_json("bonus_broken_telephone.json", bonus_broken_telephone(corpus, fast, torch, AutoTokenizer))
+
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast", action="store_true", help="быстрый режим для CI")
+    parser.add_argument("--bonus", action="store_true", help="выполнить три дополнительных эксперимента")
+    parser.add_argument("--bonus-only", action="store_true", help="повторить бонусы, не перезаписывая основные артефакты")
     args = parser.parse_args()
+    if args.bonus and args.bonus_only:
+        parser.error("используйте только один из флагов --bonus и --bonus-only")
     ARTIFACTS.mkdir(exist_ok=True)
     corpus = load_corpus()
+    if args.bonus_only:
+        paragraphs_path = ARTIFACTS / "paragraphs.json"
+        if not paragraphs_path.exists():
+            raise RuntimeError("Сначала выполните полный основной прогон: python lab02/run.py")
+        paragraphs = json.loads(paragraphs_path.read_text(encoding="utf-8"))
+        if len(paragraphs) < 500:
+            raise RuntimeError("Для бонусных запросов нужен полный paragraphs.json из 500 абзацев")
+        np, torch, AutoModel, AutoTokenizer = import_ml()
+        qwen_tokenizer, qwen_model = load_qwen(AutoModel, AutoTokenizer)
+        run_bonuses(
+            corpus, paragraphs, fast=False, qwen_tokenizer=qwen_tokenizer, qwen_model=qwen_model,
+            torch=torch, np=np, AutoModel=AutoModel, AutoTokenizer=AutoTokenizer,
+        )
+        return
     words = normalized_words(corpus)
     save_json("bpe.json", make_bpe_artifact(words, args.fast))
 
@@ -354,6 +572,11 @@ def main() -> None:
         writer = csv.DictWriter(file, fieldnames=list(dilution[0]))
         writer.writeheader()
         writer.writerows(dilution)
+    if args.bonus:
+        run_bonuses(
+            corpus, paragraphs, args.fast, qwen_tokenizer, qwen_model,
+            torch, np, AutoModel, AutoTokenizer,
+        )
 
 
 if __name__ == "__main__":
