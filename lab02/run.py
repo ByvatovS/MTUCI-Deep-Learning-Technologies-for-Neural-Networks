@@ -35,8 +35,7 @@ ENGLISH_PARAGRAPH = (
 ATTENTION_SENTENCE = "Врач осмотрел пациента и сказал, что его анализы готовы."
 INSTRUCTION = "Отвечай только по-русски и в конце каждого ответа ставь слово КОНЕЦ."
 
-# Запросы написаны своими словами к абзацам со второй половины выборки из 500.
-# answer_phrase нужна только для автоматической проверки правильного абзаца.
+
 BONUS_OWN_QUERIES = [
     ("Что почувствовали Ростов и немецкий крестьянин после случайной радостной встречи?",
      "взаимной любви"),
@@ -79,7 +78,6 @@ def normalized_words(text: str) -> list[str]:
 
 
 def load_corpus() -> str:
-    """Скачивает корпус один раз; сам corpus.txt не должен попадать в Git."""
     if not CORPUS_PATH.exists():
         print("Скачиваю корпус «Война и мир»...")
         request = urllib.request.Request(CORPUS_URL, headers={"User-Agent": "lab02-course-script"})
@@ -103,7 +101,7 @@ def merge_pair(symbols: tuple[str, ...], pair: tuple[str, str]) -> tuple[str, ..
 
 
 def train_bpe(words: Iterable[str], n_merges: int, min_frequency: int = 2) -> list[tuple[str, str]]:
-    """Классический BPE над словарём типов; частоты учитываются в каждой паре."""
+    """Классический BPE над словарём типов. Частоты учитываются в каждой паре."""
     frequencies = Counter(words)
     vocab: dict[tuple[str, ...], int] = {
         tuple(word) + ("</w>",): count for word, count in frequencies.items() if count >= min_frequency
@@ -112,8 +110,6 @@ def train_bpe(words: Iterable[str], n_merges: int, min_frequency: int = 2) -> li
     for _ in range(n_merges):
         pair_counts: Counter[tuple[str, str]] = Counter()
         for symbols, count in vocab.items():
-            # Одна и та же пара может встретиться в слове несколько раз, поэтому
-            # нельзя передавать dict в Counter.update: он бы потерял повторы.
             for pair in zip(symbols, symbols[1:]):
                 pair_counts[pair] += count
         if not pair_counts:
@@ -129,7 +125,6 @@ def train_bpe(words: Iterable[str], n_merges: int, min_frequency: int = 2) -> li
 
 
 def apply_bpe(word: str, ranks: dict[tuple[str, str], int]) -> list[str]:
-    """Применяет слияния в порядке обучения (как проверяют тесты)."""
     symbols = list(word) + ["</w>"]
     while len(symbols) > 1:
         candidates = [(ranks[pair], i) for i, pair in enumerate(zip(symbols, symbols[1:])) if pair in ranks]
@@ -180,7 +175,6 @@ def load_qwen(AutoModel, AutoTokenizer):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
-    # eager обязателен для output_attentions; модель не нужно загружать дважды.
     model = AutoModel.from_pretrained(QWEN_MODEL, attn_implementation="eager")
     model.eval()
     return tokenizer, model
@@ -200,8 +194,6 @@ def make_token_artifact(corpus_words: list[str], tokenizer) -> dict:
                    "words_in_context": int(4096 / ru_per_word)},
             "en": {"words": len(en_words), "tokens": len(en_ids), "tokens_per_word": round(en_per_word, 3),
                    "words_in_context": int(4096 / en_per_word)},
-            # У Qwen byte-level представление токенов выглядит как «Ð...». Для
-            # отчёта берём исходные символы текста по смещениям токенов.
             "example_ru": [ru_text[start:end] for start, end in ru_encoded["offset_mapping"][:20]]}
 
 
@@ -210,7 +202,6 @@ def select_paragraphs(corpus: str, fast: bool) -> list[dict]:
     raw_paragraphs = corpus.splitlines()
     selected = []
     for raw in raw_paragraphs:
-        # Абзац храним как в исходном корпусе; тесты сверяют текст посимвольно.
         text = raw.strip()
         if 40 <= len(normalized_words(text)) <= 120:
             selected.append({"id": len(selected), "text": text})
@@ -304,14 +295,9 @@ def attention_artifact(tokenizer, model, torch) -> dict:
             best_share, best_layer, best_head = float(value), layer, int(head)
             best_weights = rows[best_head].tolist()
     assert best_weights is not None
-    # Веса получены из bfloat16, поэтому их сумма может чуть отличаться от 1.
-    # Нормируем перед сохранением: это то же распределение, но без погрешности.
     weight_sum = sum(best_weights)
     best_weights = [weight / weight_sum for weight in best_weights]
     best_share = sum(best_weights[index] for index in antecedent_pos)
-    # convert_ids_to_tokens у Qwen показывает внутренние byte-level токены
-    # («Ð...») вместо кириллицы. Смещения однозначно возвращают фрагменты
-    # исходного предложения и подходят для подписей графика.
     display_tokens = [ATTENTION_SENTENCE[start:end] for start, end in offsets]
     return {"sentence": ATTENTION_SENTENCE, "tokens": display_tokens,
             "pronoun_pos": pronoun_pos, "antecedent_pos": antecedent_pos, "best_layer": best_layer,
@@ -335,8 +321,6 @@ def dilution_rows(corpus: str, tokenizer, model, torch, fast: bool) -> list[dict
     lengths = (64, 256, 768) if fast else (128, 512, 1024)
     instruction_ids = tokenizer(INSTRUCTION, add_special_tokens=False)["input_ids"]
     newline_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
-    # Нужна лишь первая тысяча токенов наполнителя. Токенизация всего романа
-    # вызывает предупреждение о превышении максимальной длины модели.
     filler_ids = tokenizer(
         corpus, add_special_tokens=False, truncation=True, max_length=max(lengths)
     )["input_ids"]
@@ -352,7 +336,7 @@ def dilution_rows(corpus: str, tokenizer, model, torch, fast: bool) -> list[dict
         instruction_end = len(instruction_ids)
         shares = [layer[0, :, -1, 1:instruction_end].float().sum(dim=-1).mean().item() for layer in layers]
         sink = [layer[0, :, -1, 0].float().mean().item() for layer in layers]
-        instruction_len = instruction_end - 1  # первый токен намеренно исключён как attention sink
+        instruction_len = instruction_end - 1 
         rows.append({"context_len": context_len, "instruction_len": instruction_len,
                      "share_on_instruction": round(sum(shares) / len(shares), 6),
                      "sink_share": round(sum(sink) / len(sink), 6),
@@ -453,13 +437,9 @@ def chat_input_for_length(tokenizer, filler: str, target_length: int):
             encoded = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
             )
-        # В зависимости от версии transformers метод может вернуть либо Tensor,
-        # либо BatchEncoding. Дальше нам нужен именно двумерный input_ids.
         return encoded["input_ids"] if hasattr(encoded, "input_ids") else encoded
 
-    # Длинный корпус целиком здесь не нужен: для 1024 токенов достаточно
-    # небольшого начального фрагмента. Это также не даёт токенизатору пытаться
-    # обработать сотни тысяч токенов при первой итерации двоичного поиска.
+
     low, high = 0, min(len(filler), target_length * 12)
     while low < high:
         middle = (low + high + 1) // 2
@@ -467,8 +447,6 @@ def chat_input_for_length(tokenizer, filler: str, target_length: int):
             low = middle
         else:
             high = middle - 1
-    # После двоичного поиска проверяем ближайшие символы: byte-level BPE может
-    # менять длину prompt сразу на несколько токенов.
     for char_count in range(low, min(len(filler), low + 1024) + 1):
         input_ids = build(char_count)
         if input_ids.shape[-1] == target_length:
@@ -510,16 +488,12 @@ def bonus_broken_telephone(corpus: str, fast: bool, torch, AutoTokenizer):
 def run_bonuses(corpus, paragraphs, fast, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer):
     """Запускает все дополнительные эксперименты только по явному флагу --bonus."""
     print("Бонус: авторские запросы...")
-    # В --fast основной поиск хранит лишь 60 абзацев, но задание для бонуса
-    # требует запросы ко второй половине полной выборки из 500 абзацев.
     bonus_paragraphs = paragraphs if len(paragraphs) >= 500 else select_paragraphs(corpus, fast=False)
     save_json("bonus_own_queries.json", bonus_own_queries(
         bonus_paragraphs, qwen_tokenizer, qwen_model, torch, np, AutoModel, AutoTokenizer
     ))
     print("Бонус: многозначное слово «ключ»...")
     save_json("bonus_polysemy.json", bonus_polysemy(qwen_tokenizer, qwen_model, torch, np))
-    # Базовая и чат-версии Qwen одновременно занимают много памяти, поэтому
-    # освобождаем первую перед загрузкой второй.
     del qwen_model
     import gc
     gc.collect()
