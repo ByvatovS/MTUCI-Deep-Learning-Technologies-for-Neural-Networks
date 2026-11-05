@@ -164,6 +164,22 @@ class TinyDecoder(nn.Module):
             x = block(x)
         return self.lm_head(self.norm(x))
 
+
+# -------------------------------------------------------------------------- TRAIN
+    def make_batch(tokens: torch.Tensor, batch: int, context: int, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+        starts = torch.randint(0, len(tokens) - context - 1, (batch,), generator=generator)
+        offsets = torch.arange(context)
+        indices = starts[:, None] + offsets[None, :]
+        return tokens[indices], tokens[indices + 1]
+
+
+    @torch.no_grad()
+    def mean_loss(model: TinyDecoder, batches: list[tuple[torch.Tensor, torch.Tensor]]) -> float:
+        model.eval()
+        values = [F.cross_entropy(model(x).reshape(-1, model.lm_head.out_features), y.reshape(-1)).item() for x, y in batches]
+        model.train()
+        return float(sum(values) / len(values))
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast", action="store_true", help="быстрый режим для CI")
