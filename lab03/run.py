@@ -108,7 +108,61 @@ class BPETokenizer:
         return re.sub(r"\s+", " ", raw.replace("</w>", " ")).strip()
 
 # -------------------------------------------------------------------------- MODEL
+class CausalSelfAttention(nn.Module):
+    """Многоголовое causal attention, записанное по формуле без готового слоя."""
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        if d_model % n_heads:
+            raise ValueError("d_model должен делиться на n_heads")
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.out = nn.Linear(d_model, d_model)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, length, width = x.shape
+        qkv = self.qkv(x).view(batch, length, 3, self.n_heads, self.head_dim)
+        query, key, value = qkv.unbind(dim=2)
+        query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+        scores = (query @ key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        causal_mask = torch.ones(length, length, dtype=torch.bool, device=x.device).tril()
+        scores = scores.masked_fill(~causal_mask, float("-inf"))
+        weights = F.softmax(scores, dim=-1)
+        attended = (weights @ value).transpose(1, 2).contiguous().view(batch, length, width)
+        return self.out(attended)
+
+class DecoderBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int):
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.attention = CausalSelfAttention(d_model, n_heads)
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.feed_forward = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attention(self.norm_attn(x))
+        return x + self.feed_forward(self.norm_ff(x))
+
+
+class TinyDecoder(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, n_layers: int, n_heads: int, d_ff: int, context: int):
+        super().__init__()
+        self.context = context
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(context, d_model)
+        self.blocks = nn.ModuleList([DecoderBlock(d_model, n_heads, d_ff) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        _, length = ids.shape
+        if length > self.context:
+            raise ValueError(f"контекст {length} превышает {self.context}")
+        positions = torch.arange(length, device=ids.device)
+        x = self.token_embedding(ids) + self.position_embedding(positions)[None, :, :]
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(self.norm(x))
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -130,7 +184,16 @@ def main() -> None:
     train_tokens = torch.tensor(tokenizer.encode_words(train_words), dtype=torch.long)
     val_tokens = torch.tensor(tokenizer.encode_words(val_words), dtype=torch.long)
 
-
+    if args.fast:
+        d_model, n_layers, n_heads, d_ff, context, steps, batch, report_every = 64, 2, 4, 256, 128, 200, 16, 25
+    else:
+        d_model, n_layers, n_heads, d_ff, context, steps, batch, report_every = 128, 4, 4, 512, 128, 2000, 32, 100
+    # У fast меньше обновлений, поэтому ему нужен немного более крупный шаг,
+    # чтобы к 200-му шагу кривая успела показать заметное обучение.
+    lr = 2e-3 if args.fast else 1e-3
+    model = TinyDecoder(tokenizer.vocab_size, d_model, n_layers, n_heads, d_ff, context)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    n_params = sum(parameter.numel() for parameter in model.parameters())
 
 if __name__ == "__main__":
     main()
