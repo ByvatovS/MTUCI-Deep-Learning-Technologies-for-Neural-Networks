@@ -180,6 +180,45 @@ class TinyDecoder(nn.Module):
         model.train()
         return float(sum(values) / len(values))
 
+
+# -------------------------------------------------------------------------- GENERATION
+def sample_next(logits: torch.Tensor, temperature: float, top_p: float | None) -> int:
+    if temperature == 0:
+        return int(torch.argmax(logits).item())
+    probabilities = F.softmax(logits / temperature, dim=-1)
+    if top_p is not None:
+        sorted_probs, sorted_ids = torch.sort(probabilities, descending=True)
+        keep = torch.cumsum(sorted_probs, dim=-1) - sorted_probs < top_p
+        keep[0] = True
+        filtered = sorted_probs * keep
+        filtered = filtered / filtered.sum()
+        return int(sorted_ids[torch.multinomial(filtered, 1)].item())
+    return int(torch.multinomial(probabilities, 1).item())
+
+
+@torch.no_grad()
+def generate(model: TinyDecoder, tokenizer: BPETokenizer, prompt: str, max_new_tokens: int,
+            temperature: float = 1.0, top_p: float | None = None) -> tuple[str, list[int]]:
+    model.eval()
+    current = tokenizer.encode_text(prompt)
+    generated: list[int] = []
+    for _ in range(max_new_tokens):
+        window = torch.tensor([current[-model.context:]], dtype=torch.long)
+        next_id = sample_next(model(window)[0, -1], temperature, top_p)
+        current.append(next_id)
+        generated.append(next_id)
+    return tokenizer.decode(current), generated
+
+
+def first_repeat(ids: list[int], width: int = 4) -> int | None:
+    seen: set[tuple[int, ...]] = set()
+    for end in range(width, len(ids) + 1):
+        group = tuple(ids[end - width:end])
+        if group in seen:
+            return end - width
+        seen.add(group)
+    return None
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast", action="store_true", help="быстрый режим для CI")
@@ -210,6 +249,64 @@ def main() -> None:
     model = TinyDecoder(tokenizer.vocab_size, d_model, n_layers, n_heads, d_ff, context)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     n_params = sum(parameter.numel() for parameter in model.parameters())
+
+
+    val_generator = torch.Generator().manual_seed(seed + 1)
+    val_batches = [make_batch(val_tokens, batch, context, val_generator) for _ in range(20)]
+    probe_generator = torch.Generator().manual_seed(seed + 2)
+    train_probe = [make_batch(train_tokens, batch, context, probe_generator) for _ in range(4)]
+    curve: list[dict[str, float | int]] = [{"step": 0, "train_loss": mean_loss(model, train_probe), "val_loss": mean_loss(model, val_batches)}]
+    sample_steps = [0, 50, 100, steps] if args.fast else [0, 100, 500, steps]
+    torch.manual_seed(seed + 10)
+    samples = [{"step": 0, "text": generate(model, tokenizer, PROMPT, 60, temperature=0.8)[0]}]
+
+    print(f"Токенов: train={len(train_tokens)}, val={len(val_tokens)}; словарь={tokenizer.vocab_size}")
+    print(f"Модель: {n_params:,} параметров; обучение {steps} шагов на CPU...")
+    started = time.perf_counter()
+    running_loss = 0.0
+    for step in range(1, steps + 1):
+        x, y = make_batch(train_tokens, batch, context, generator)
+        logits = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, tokenizer.vocab_size), y.reshape(-1))
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        running_loss += float(loss.item())
+        if step in sample_steps and step != 0:
+            torch.manual_seed(seed + 10 + step)
+            samples.append({"step": step, "text": generate(model, tokenizer, PROMPT, 60, temperature=0.8)[0]})
+        if step % report_every == 0 or step == steps:
+            curve.append({"step": step, "train_loss": running_loss / report_every, "val_loss": mean_loss(model, val_batches)})
+            print(f"шаг {step:4d}: train={curve[-1]['train_loss']:.4f}, val={curve[-1]['val_loss']:.4f}")
+            running_loss = 0.0
+    minutes = (time.perf_counter() - started) / 60
+
+    with (ARTIFACTS / "train_curve.csv").open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=["step", "train_loss", "val_loss"])
+        writer.writeheader()
+        writer.writerows(curve)
+    save_json("tiny_config.json", {
+        "vocab_size": tokenizer.vocab_size, "d_model": d_model, "n_layers": n_layers, "n_heads": n_heads,
+        "d_ff": d_ff, "context": context, "n_params": n_params, "steps": steps, "batch": batch, "lr": lr,
+        "seed": seed, "train_tokens": len(train_tokens), "val_tokens": len(val_tokens),
+        "bpe_merges": len(bpe_data["merges"]), "train_minutes": round(minutes, 3), "device": "cpu",
+    })
+    save_json("samples.json", {"prompt": PROMPT, "temperature": 0.8, "samples": samples})
+
+    max_new_tokens = 40 if args.fast else 80
+    modes = [("greedy", 0.0, None), ("t0.7", 0.7, None), ("t1.5", 1.5, None), ("top_p0.9", 1.0, 0.9)]
+    runs = []
+    for name, temperature, top_p in modes:
+        torch.manual_seed(seed + 100 + len(runs))
+        text, ids = generate(model, tokenizer, PROMPT, max_new_tokens, temperature, top_p)
+        run = {"name": name, "temperature": temperature, "top_p": top_p, "text": text, "ids": ids, "n_tokens": len(ids)}
+        if name == "greedy":
+            run["loop_start"] = first_repeat(ids)
+        runs.append(run)
+    save_json("generation.json", {"model": "tiny", "prompt": PROMPT, "max_new_tokens": max_new_tokens, "runs": runs})
+    print(f"Готово за {minutes:.2f} мин. Артефакты: {ARTIFACTS}")
+
 
 if __name__ == "__main__":
     main()
