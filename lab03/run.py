@@ -1,22 +1,135 @@
-"""Лабораторная 3. Задание: assignments/03/README.md в репозитории курса.
-
-Запуск: python lab03/run.py, для CI python lab03/run.py --fast.
-Слияния BPE берутся из lab02/artifacts/bpe.json.
+"""Лабораторная 3: маленькая decoder-only языковая модель на PyTorch.
 """
+
 import argparse
+import csv
+import json
+import math
+import os
+import random
+import re
+import time
+import urllib.request
 from pathlib import Path
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
 
 HERE = Path(__file__).resolve().parent
 ARTIFACTS = HERE / "artifacts"
-BPE = HERE.parent / "lab02" / "artifacts" / "bpe.json"
+DEFAULT_BPE = HERE.parent / "lab02" / "artifacts" / "bpe.json"
+LOCAL_CORPUS = HERE / "corpus.txt"
+LAB02_CORPUS = HERE.parent / "lab02" / "corpus.txt"
+CORPUS_URL = "https://raw.githubusercontent.com/nevmenandr/word2vec-russian-novels/master/books_before/WarAndPeace.txt"
+WORD_RE = re.compile(r"[а-я]+(?:-[а-я]+)*")
+PROMPT = "князь андрей"
+
+
+# -------------------------------------------------------------------------- DATA
+def save_json(name: str, value: dict) -> None:
+    (ARTIFACTS / name).write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def get_corpus() -> str:
+    """Берёт уже скачанный корпус лабы 2 либо скачивает свою копию."""
+    if LAB02_CORPUS.exists():
+        return LAB02_CORPUS.read_text(encoding="utf-8")
+    if not LOCAL_CORPUS.exists():
+        print("Скачиваю корпус «Война и мир»...")
+        urllib.request.urlretrieve(CORPUS_URL, LOCAL_CORPUS)
+    return LOCAL_CORPUS.read_text(encoding="utf-8")
+
+
+def normalise_words(text: str) -> list[str]:
+    return WORD_RE.findall(text.lower().replace("ё", "е"))
+
+
+def merge_pair(symbols: tuple[str, ...], pair: tuple[str, str]) -> tuple[str, ...]:
+    merged: list[str] = []
+    index = 0
+    while index < len(symbols):
+        if index + 1 < len(symbols) and (symbols[index], symbols[index + 1]) == pair:
+            merged.append(symbols[index] + symbols[index + 1])
+            index += 2
+        else:
+            merged.append(symbols[index])
+            index += 1
+    return tuple(merged)
+
+
+def apply_bpe(word: str, ranks: dict[tuple[str, str], int]) -> list[str]:
+    """Применяет слияния BPE в том же порядке, в котором они обучались."""
+    symbols = tuple(word) + ("</w>",)
+    while len(symbols) > 1:
+        candidates = [
+            (ranks[pair], pos)
+            for pos, pair in enumerate(zip(symbols, symbols[1:]))
+            if pair in ranks
+        ]
+        if not candidates:
+            break
+        _, position = min(candidates)
+        symbols = merge_pair(symbols, (symbols[position], symbols[position + 1]))
+    return list(symbols)
+
+
+class BPETokenizer:
+    def __init__(self, merges: list[list[str]], words: list[str]):
+        self.merges = [tuple(pair) for pair in merges]
+        self.ranks = {pair: index for index, pair in enumerate(self.merges)}
+        self.cache: dict[str, list[str]] = {}
+        for word in set(words):
+            self.cache[word] = apply_bpe(word, self.ranks)
+        token_set = {piece for pieces in self.cache.values() for piece in pieces}
+        self.id_to_token = sorted(token_set)
+        self.token_to_id = {token: index for index, token in enumerate(self.id_to_token)}
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.id_to_token)
+
+    def pieces(self, word: str) -> list[str]:
+        if word not in self.cache:
+            self.cache[word] = apply_bpe(word, self.ranks)
+        return self.cache[word]
+
+    def encode_words(self, words: list[str]) -> list[int]:
+        return [self.token_to_id[piece] for word in words for piece in self.pieces(word)]
+
+    def encode_text(self, text: str) -> list[int]:
+        return self.encode_words(normalise_words(text))
+
+    def decode(self, ids: list[int]) -> str:
+        raw = "".join(self.id_to_token[index] for index in ids)
+        return re.sub(r"\s+", " ", raw.replace("</w>", " ")).strip()
+
+# -------------------------------------------------------------------------- MODEL
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fast", action="store_true", help="быстрый режим для CI")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fast", action="store_true", help="быстрый режим для CI")
+    parser.add_argument("--bpe", type=Path, default=DEFAULT_BPE, help="путь к bpe.json из лабы 2")
+    args = parser.parse_args()
+
     ARTIFACTS.mkdir(exist_ok=True)
-    raise NotImplementedError("работа не начата")
+    torch.set_num_threads(min(8, os.cpu_count() or 1))
+    seed = 0
+    random.seed(seed)
+    torch.manual_seed(seed)
+    generator = torch.Generator().manual_seed(seed)
+    raw_words = normalise_words(get_corpus())
+    split = int(len(raw_words) * 0.9)
+    train_words, val_words = raw_words[:split], raw_words[split:]
+    bpe_data = json.loads(args.bpe.read_text(encoding="utf-8"))
+    tokenizer = BPETokenizer(bpe_data["merges"], raw_words)
+    train_tokens = torch.tensor(tokenizer.encode_words(train_words), dtype=torch.long)
+    val_tokens = torch.tensor(tokenizer.encode_words(val_words), dtype=torch.long)
+
 
 
 if __name__ == "__main__":
