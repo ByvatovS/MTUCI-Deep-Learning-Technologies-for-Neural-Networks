@@ -94,3 +94,28 @@ def few_shot_examples(split) -> list[dict[str, object]]:
     raise RuntimeError("В validation не нашлись все пять классов")
 
 
+#---------------------------------------------- PROMPT CONSTRUCTION
+def user_message(text: str) -> str:
+    return f"Отзыв:\n{text}\n\nКакую оценку от 1 до 5 поставил автор?"
+
+
+def messages_for(text: str, examples: list[dict[str, object]] | None = None) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for example in examples or []:
+        messages.append({"role": "user", "content": user_message(str(example["text"]))})
+        messages.append({"role": "assistant", "content": str(example["label"])})
+    messages.append({"role": "user", "content": user_message(text)})
+    return messages
+
+
+def chat_ids(tokenizer, messages: list[dict[str, str]], add_generation_prompt: bool, max_len: int = 2048) -> list[int]:
+    """Один чат-шаблон Qwen; thinking отключён во всех режимах."""
+    rendered = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=add_generation_prompt, enable_thinking=False
+    )
+    return tokenizer(rendered, add_special_tokens=False, truncation=True, max_length=max_len)["input_ids"]
+
+
+def parse_star(raw: str) -> int | None:
+    match = re.search(r"(?<!\d)([1-5])(?!\d)", raw)
+    return int(match.group(1)) if match else None
